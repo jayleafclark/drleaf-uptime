@@ -1,0 +1,54 @@
+name: uptime
+
+# External uptime monitor for the Dr. Leaf comment-engine (a separate, PUBLIC repo so GitHub Actions
+# minutes are unlimited and free -> we can check every 5 min). This is the ONLY watcher that can speak
+# up when the engine process is fully dead: the engine's own watchdog + boot alert can't fire when the
+# process they live in is gone. If the health URL is unreachable, it Slacks #publish-alerts.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"     # ping every 5 min
+    - cron: "13 6 * * 1"      # weekly keepalive (Mon 06:13 UTC) so the schedule never auto-disables
+  workflow_dispatch: {}
+
+permissions:
+  contents: write             # only the weekly keepalive uses this
+
+concurrency:
+  group: uptime
+  cancel-in-progress: true
+
+jobs:
+  ping:
+    if: github.event.schedule == '*/5 * * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping engine; Slack if down
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ENGINE: https://worker-production-7a82.up.railway.app
+        run: |
+          ok=0
+          for i in 1 2 3; do
+            if curl -s --max-time 20 "$ENGINE/" | grep -q '"ok":true'; then ok=1; break; fi
+            echo "attempt $i: unreachable"; sleep 15
+          done
+          if [ "$ok" = "1" ]; then echo "engine up"; exit 0; fi
+          echo "engine DOWN after 3 attempts"
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data '{"text":":rotating_light: *Comment engine is DOWN / unreachable* — external uptime check failed 3x over ~45s. Railway is set to auto-restart (policy=ALWAYS); if you are seeing this it did NOT recover on its own — open the Railway dashboard for the worker service and redeploy. (drleaf-uptime external monitor, every 5 min)"}' \
+            "$SLACK_WEBHOOK_URL"
+
+  keepalive:
+    if: github.event.schedule == '13 6 * * 1'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Touch heartbeat so the repo stays active
+        run: |
+          date -u > .last_keepalive
+          git config user.name "uptime-bot"
+          git config user.email "uptime-bot@users.noreply.github.com"
+          git add .last_keepalive
+          git commit -m "keepalive" || exit 0
+          git push
